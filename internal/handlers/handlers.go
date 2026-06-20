@@ -2,17 +2,68 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"venue-booking-admin/internal/auth"
 	"venue-booking-admin/internal/models"
+	"venue-booking-admin/internal/services"
 )
 
-// Handler 持有数据库句柄。
+// Handler 持有数据库句柄与各业务服务。
 type Handler struct {
-	DB *gorm.DB
+	DB              *gorm.DB
+	WalletSvc       *services.WalletService
+	CancellationSvc *services.CancellationService
+	DepositSvc      *services.DepositService
+	BookingSvc      *services.BookingService
+	ReconSvc        *services.ReconciliationService
+	StatsSvc        *services.StatsService
+	CustomerSvc     *services.CustomerService
+}
+
+// InitServices 初始化所有业务服务。
+func (h *Handler) InitServices() {
+	h.WalletSvc = services.NewWalletService(h.DB)
+	h.CancellationSvc = services.NewCancellationService(h.DB)
+	h.DepositSvc = services.NewDepositService(h.DB, h.WalletSvc)
+	h.BookingSvc = services.NewBookingService(h.DB, h.WalletSvc, h.CancellationSvc, h.DepositSvc)
+	h.ReconSvc = services.NewReconciliationService(h.DB)
+	h.StatsSvc = services.NewStatsService(h.DB)
+	h.CustomerSvc = services.NewCustomerService(h.DB)
+}
+
+// parsePage 解析分页参数。
+func parsePage(c *gin.Context) (int, int) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	return page, pageSize
+}
+
+// parseUintParam 解析 uint 参数。
+func parseUintParam(c *gin.Context, name string) (uint, error) {
+	v, err := strconv.ParseUint(c.Param(name), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint(v), nil
+}
+
+// parseUintQuery 解析 uint query 参数。
+func parseUintQuery(c *gin.Context, name string) uint {
+	v, err := strconv.ParseUint(c.Query(name), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return uint(v)
 }
 
 // ---------- 认证 ----------
@@ -53,13 +104,15 @@ func (h *Handler) Me(c *gin.Context) {
 // ---------- 场馆 ----------
 
 type venueReq struct {
-	Name        string  `json:"name" binding:"required"`
-	SportType   string  `json:"sport_type"`
-	Capacity    int     `json:"capacity"`
-	HourlyPrice float64 `json:"hourly_price"`
-	OpenHour    int     `json:"open_hour"`
-	CloseHour   int     `json:"close_hour"`
-	Status      string  `json:"status"`
+	Name           string  `json:"name" binding:"required"`
+	SportType      string  `json:"sport_type"`
+	Capacity       int     `json:"capacity"`
+	HourlyPrice    float64 `json:"hourly_price"`
+	OpenHour       int     `json:"open_hour"`
+	CloseHour      int     `json:"close_hour"`
+	Status         string  `json:"status"`
+	RequireDeposit bool    `json:"require_deposit"`
+	DepositAmount  float64 `json:"deposit_amount"`
 }
 
 func (h *Handler) ListVenues(c *gin.Context) {
@@ -85,6 +138,7 @@ func (h *Handler) CreateVenue(c *gin.Context) {
 	venue := models.Venue{
 		Name: req.Name, SportType: req.SportType, Capacity: req.Capacity,
 		HourlyPrice: req.HourlyPrice, OpenHour: req.OpenHour, CloseHour: req.CloseHour, Status: status,
+		RequireDeposit: req.RequireDeposit, DepositAmount: req.DepositAmount,
 	}
 	h.DB.Create(&venue)
 	c.JSON(http.StatusCreated, venue)
@@ -121,6 +175,8 @@ func (h *Handler) UpdateVenue(c *gin.Context) {
 	if req.Status != "" {
 		venue.Status = req.Status
 	}
+	venue.RequireDeposit = req.RequireDeposit
+	venue.DepositAmount = req.DepositAmount
 	h.DB.Save(&venue)
 	c.JSON(http.StatusOK, venue)
 }
@@ -135,28 +191,235 @@ func (h *Handler) DeleteVenue(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// ---------- 预订 ----------
+// ---------- 客户 ----------
+
+type customerReq struct {
+	Name   string `json:"name" binding:"required"`
+	Phone  string `json:"phone" binding:"required"`
+	Status string `json:"status"`
+}
+
+func (h *Handler) CreateCustomer(c *gin.Context) {
+	var req customerReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	customer, err := h.CustomerSvc.CreateCustomer(req.Name, req.Phone)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, customer)
+}
+
+func (h *Handler) ListCustomers(c *gin.Context) {
+	keyword := c.Query("keyword")
+	status := c.Query("status")
+	page, pageSize := parsePage(c)
+	customers, total, err := h.CustomerSvc.ListCustomers(keyword, status, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": customers, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (h *Handler) GetCustomer(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	customer, err := h.CustomerSvc.GetCustomer(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "客户不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, customer)
+}
+
+func (h *Handler) UpdateCustomer(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req customerReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	customer, err := h.CustomerSvc.UpdateCustomer(id, req.Name, req.Phone, req.Status)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, customer)
+}
+
+// ---------- 钱包 ----------
+
+type rechargeReq struct {
+	CustomerID uint    `json:"customer_id" binding:"required"`
+	Amount     float64 `json:"amount" binding:"required"`
+	Remark     string  `json:"remark"`
+}
+
+func (h *Handler) WalletRecharge(c *gin.Context) {
+	var req rechargeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	wallet, tx, err := h.WalletSvc.Recharge(req.CustomerID, req.Amount, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"wallet": wallet, "transaction": tx})
+}
+
+type deductReq struct {
+	CustomerID  uint    `json:"customer_id" binding:"required"`
+	Amount      float64 `json:"amount" binding:"required"`
+	RelatedType string  `json:"related_type"`
+	RelatedID   uint    `json:"related_id"`
+	Remark      string  `json:"remark"`
+}
+
+func (h *Handler) WalletDeduct(c *gin.Context) {
+	var req deductReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	tx, err := h.WalletSvc.Deduct(req.CustomerID, req.Amount, req.RelatedType, req.RelatedID, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, tx)
+}
+
+type freezeReq struct {
+	CustomerID  uint    `json:"customer_id" binding:"required"`
+	Amount      float64 `json:"amount" binding:"required"`
+	FreezeType  string  `json:"freeze_type"`
+	RelatedType string  `json:"related_type"`
+	RelatedID   uint    `json:"related_id"`
+	Remark      string  `json:"remark"`
+}
+
+func (h *Handler) WalletFreeze(c *gin.Context) {
+	var req freezeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	freeze, err := h.WalletSvc.Freeze(req.CustomerID, req.Amount, req.FreezeType, req.RelatedType, req.RelatedID, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, freeze)
+}
+
+type unfreezeReq struct {
+	FreezeID uint   `json:"freeze_id" binding:"required"`
+	Remark   string `json:"remark"`
+}
+
+func (h *Handler) WalletUnfreeze(c *gin.Context) {
+	var req unfreezeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	if err := h.WalletSvc.Unfreeze(req.FreezeID, req.Remark); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+type refundReq struct {
+	CustomerID  uint    `json:"customer_id" binding:"required"`
+	Amount      float64 `json:"amount" binding:"required"`
+	RelatedType string  `json:"related_type"`
+	RelatedID   uint    `json:"related_id"`
+	Remark      string  `json:"remark"`
+}
+
+func (h *Handler) WalletRefund(c *gin.Context) {
+	var req refundReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	tx, err := h.WalletSvc.Refund(req.CustomerID, req.Amount, req.RelatedType, req.RelatedID, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, tx)
+}
+
+func (h *Handler) GetWallet(c *gin.Context) {
+	customerID := parseUintQuery(c, "customer_id")
+	if customerID == 0 {
+		id, err := parseUintParam(c, "customer_id")
+		if err != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "客户ID不合法"})
+			return
+		}
+		customerID = id
+	}
+	wallet, err := h.WalletSvc.GetWallet(customerID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, wallet)
+}
+
+func (h *Handler) ListWalletTransactions(c *gin.Context) {
+	customerID := parseUintQuery(c, "customer_id")
+	txType := c.Query("tx_type")
+	page, pageSize := parsePage(c)
+	txs, total, err := h.WalletSvc.ListTransactions(customerID, txType, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": txs, "total": total, "page": page, "page_size": pageSize})
+}
+
+// ---------- 预订（接入钱包） ----------
 
 type bookingReq struct {
 	VenueID      uint   `json:"venue_id" binding:"required"`
+	CustomerID   uint   `json:"customer_id"`
 	CustomerName string `json:"customer_name" binding:"required"`
 	Phone        string `json:"phone"`
 	BookDate     string `json:"book_date" binding:"required"`
 	StartHour    int    `json:"start_hour"`
 	EndHour      int    `json:"end_hour"`
+	UseWallet    bool   `json:"use_wallet"`
 }
 
 func (h *Handler) ListBookings(c *gin.Context) {
-	var bookings []models.Booking
-	q := h.DB.Order("id desc")
-	if vid := c.Query("venue_id"); vid != "" {
-		q = q.Where("venue_id = ?", vid)
+	venueID := parseUintQuery(c, "venue_id")
+	customerID := parseUintQuery(c, "customer_id")
+	status := c.Query("status")
+	date := c.Query("date")
+	page, pageSize := parsePage(c)
+	bookings, total, err := h.BookingSvc.ListBookings(venueID, customerID, status, date, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
 	}
-	if d := c.Query("date"); d != "" {
-		q = q.Where("book_date = ?", d)
-	}
-	q.Find(&bookings)
-	c.JSON(http.StatusOK, bookings)
+	c.JSON(http.StatusOK, gin.H{"items": bookings, "total": total, "page": page, "page_size": pageSize})
 }
 
 func (h *Handler) CreateBooking(c *gin.Context) {
@@ -165,67 +428,411 @@ func (h *Handler) CreateBooking(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
 		return
 	}
-	if req.EndHour <= req.StartHour {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "结束时间须晚于开始时间"})
+	booking, err := h.BookingSvc.CreateBookingWithWallet(services.CreateBookingParams{
+		VenueID:      req.VenueID,
+		CustomerID:   req.CustomerID,
+		CustomerName: req.CustomerName,
+		Phone:        req.Phone,
+		BookDate:     req.BookDate,
+		StartHour:    req.StartHour,
+		EndHour:      req.EndHour,
+		UseWallet:    req.UseWallet,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
-	var venue models.Venue
-	if err := h.DB.First(&venue, req.VenueID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"detail": "场馆不存在"})
-		return
-	}
-	if venue.Status != "open" {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "该场馆当前不可预订"})
-		return
-	}
-	if req.StartHour < venue.OpenHour || req.EndHour > venue.CloseHour {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "预订时段超出场馆开放时间"})
-		return
-	}
-
-	// 时段冲突校验：同场馆同日，已有非取消预订时段不得与本次重叠
-	var conflict int64
-	h.DB.Model(&models.Booking{}).
-		Where("venue_id = ? AND book_date = ? AND status <> ?", req.VenueID, req.BookDate, "cancelled").
-		Where("start_hour < ? AND end_hour > ?", req.EndHour, req.StartHour).
-		Count(&conflict)
-	if conflict > 0 {
-		c.JSON(http.StatusConflict, gin.H{"detail": "该时段已被预订"})
-		return
-	}
-
-	amount := venue.HourlyPrice * float64(req.EndHour-req.StartHour)
-	booking := models.Booking{
-		VenueID: req.VenueID, CustomerName: req.CustomerName, Phone: req.Phone,
-		BookDate: req.BookDate, StartHour: req.StartHour, EndHour: req.EndHour,
-		Amount: amount, Status: "booked",
-	}
-	h.DB.Create(&booking)
 	c.JSON(http.StatusCreated, booking)
 }
 
-type statusReq struct {
-	Status string `json:"status" binding:"required"`
+type cancelBookingReq struct {
+	Reason string `json:"reason"`
 }
 
-func (h *Handler) UpdateBookingStatus(c *gin.Context) {
-	var booking models.Booking
-	if err := h.DB.First(&booking, c.Param("id")).Error; err != nil {
+func (h *Handler) CancelBooking(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req cancelBookingReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Reason = "用户主动取消"
+	}
+	booking, result, err := h.BookingSvc.CancelBooking(id, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error(), "result": result})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"booking": booking, "cancel_result": result})
+}
+
+type noShowReq struct {
+	Reason string `json:"reason"`
+}
+
+func (h *Handler) MarkBookingNoShow(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req noShowReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.Reason = "爽约"
+	}
+	booking, result, err := h.BookingSvc.MarkNoShow(id, req.Reason)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"booking": booking, "no_show_result": result})
+}
+
+type completeBookingReq struct {
+	Remark string `json:"remark"`
+}
+
+func (h *Handler) CompleteBooking(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req completeBookingReq
+	c.ShouldBindJSON(&req)
+	booking, err := h.BookingSvc.CompleteBooking(id, req.Remark)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, booking)
+}
+
+func (h *Handler) PreviewCancellation(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	booking, err := h.BookingSvc.GetBooking(id)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "预订不存在"})
 		return
 	}
-	var req statusReq
+	result, err := h.CancellationSvc.CalculateCancellation(booking)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// ---------- 退订规则 ----------
+
+type cancelRuleReq struct {
+	VenueID             uint    `json:"venue_id"`
+	Name                string  `json:"name" binding:"required"`
+	MinHoursBeforeStart int     `json:"min_hours_before_start"`
+	MaxHoursBeforeStart int     `json:"max_hours_before_start"`
+	RefundRate          float64 `json:"refund_rate"`
+	PenaltyRate         float64 `json:"penalty_rate"`
+	PenaltyFixed        float64 `json:"penalty_fixed"`
+	IsDefault           bool    `json:"is_default"`
+	Priority            int     `json:"priority"`
+}
+
+func (h *Handler) ListCancellationRules(c *gin.Context) {
+	venueID := parseUintQuery(c, "venue_id")
+	rules, err := h.CancellationSvc.ListRules(venueID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rules)
+}
+
+func (h *Handler) CreateCancellationRule(c *gin.Context) {
+	var req cancelRuleReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "状态不合法"})
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
 		return
 	}
-	if req.Status != "booked" && req.Status != "cancelled" && req.Status != "completed" {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "状态不合法"})
+	rule := &models.CancellationRule{
+		VenueID:             req.VenueID,
+		Name:                req.Name,
+		MinHoursBeforeStart: req.MinHoursBeforeStart,
+		MaxHoursBeforeStart: req.MaxHoursBeforeStart,
+		RefundRate:          req.RefundRate,
+		PenaltyRate:         req.PenaltyRate,
+		PenaltyFixed:        req.PenaltyFixed,
+		IsDefault:           req.IsDefault,
+		Priority:            req.Priority,
+	}
+	if err := h.CancellationSvc.CreateRule(rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
-	booking.Status = req.Status
-	h.DB.Save(&booking)
-	c.JSON(http.StatusOK, gin.H{"id": booking.ID, "status": booking.Status})
+	c.JSON(http.StatusCreated, rule)
+}
+
+func (h *Handler) UpdateCancellationRule(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req cancelRuleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	updates := map[string]interface{}{
+		"name":                  req.Name,
+		"min_hours_before_start": req.MinHoursBeforeStart,
+		"max_hours_before_start": req.MaxHoursBeforeStart,
+		"refund_rate":           req.RefundRate,
+		"penalty_rate":          req.PenaltyRate,
+		"penalty_fixed":         req.PenaltyFixed,
+		"is_default":            req.IsDefault,
+		"priority":              req.Priority,
+	}
+	if err := h.CancellationSvc.UpdateRule(id, updates); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id, "status": "updated"})
+}
+
+func (h *Handler) DeleteCancellationRule(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	if err := h.CancellationSvc.DeleteRule(id); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---------- 爽约规则 ----------
+
+type noShowRuleReq struct {
+	VenueID       uint    `json:"venue_id"`
+	PenaltyRate   float64 `json:"penalty_rate"`
+	PenaltyFixed  float64 `json:"penalty_fixed"`
+	DeductDeposit bool    `json:"deduct_deposit"`
+}
+
+func (h *Handler) ListNoShowRules(c *gin.Context) {
+	venueID := parseUintQuery(c, "venue_id")
+	rules, err := h.CancellationSvc.ListNoShowRules(venueID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rules)
+}
+
+func (h *Handler) CreateNoShowRule(c *gin.Context) {
+	var req noShowRuleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	rule := &models.NoShowRule{
+		VenueID:       req.VenueID,
+		PenaltyRate:   req.PenaltyRate,
+		PenaltyFixed:  req.PenaltyFixed,
+		DeductDeposit: req.DeductDeposit,
+	}
+	if err := h.CancellationSvc.CreateNoShowRule(rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, rule)
+}
+
+// ---------- 押金 ----------
+
+type depositDeductReq struct {
+	Amount float64 `json:"amount" binding:"required"`
+	Remark string  `json:"remark"`
+}
+
+type depositRefundReq struct {
+	Amount float64 `json:"amount"`
+	Remark string  `json:"remark"`
+}
+
+func (h *Handler) ListDeposits(c *gin.Context) {
+	customerID := parseUintQuery(c, "customer_id")
+	venueID := parseUintQuery(c, "venue_id")
+	status := c.Query("status")
+	page, pageSize := parsePage(c)
+	deposits, total, err := h.DepositSvc.ListDeposits(customerID, venueID, status, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": deposits, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (h *Handler) GetDepositByBooking(c *gin.Context) {
+	bookingID, err := parseUintParam(c, "booking_id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "预订ID不合法"})
+		return
+	}
+	deposit, err := h.DepositSvc.GetDepositByBooking(bookingID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "押金记录不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, deposit)
+}
+
+func (h *Handler) RefundDeposit(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req depositRefundReq
+	c.ShouldBindJSON(&req)
+	if req.Amount > 0 {
+		if err := h.DepositSvc.PartialRefundDeposit(id, req.Amount, req.Remark); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+			return
+		}
+	} else {
+		if err := h.DepositSvc.RefundDeposit(id, req.Remark); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "refunded"})
+}
+
+func (h *Handler) DeductDeposit(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	var req depositDeductReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "请求参数不合法"})
+		return
+	}
+	if err := h.DepositSvc.DeductDeposit(id, req.Amount, req.Remark); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "deducted"})
+}
+
+// ---------- 对账 ----------
+
+func (h *Handler) DoReconciliation(c *gin.Context) {
+	date := c.Query("date")
+	if date == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "必须指定对账日期"})
+		return
+	}
+	recon, diffs, err := h.ReconSvc.DoReconciliation(date)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"reconciliation": recon, "diffs": diffs})
+}
+
+func (h *Handler) ListReconciliations(c *gin.Context) {
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	status := c.Query("status")
+	page, pageSize := parsePage(c)
+	list, total, err := h.ReconSvc.ListReconciliations(startDate, endDate, status, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": list, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (h *Handler) GetReconciliationDiffs(c *gin.Context) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "ID不合法"})
+		return
+	}
+	diffs, err := h.ReconSvc.GetReconciliationDiffs(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, diffs)
+}
+
+func (h *Handler) WalletBalanceCheck(c *gin.Context) {
+	result, mismatches, err := h.ReconSvc.WalletBalanceRecon()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"summary": result, "mismatch_wallet_ids": mismatches})
+}
+
+// ---------- 统计报表 ----------
+
+func (h *Handler) CancellationStats(c *gin.Context) {
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	venueID := parseUintQuery(c, "venue_id")
+	stats, err := h.StatsSvc.GetCancellationStats(startDate, endDate, venueID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
+func (h *Handler) NoShowStats(c *gin.Context) {
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	venueID := parseUintQuery(c, "venue_id")
+	stats, err := h.StatsSvc.GetNoShowStats(startDate, endDate, venueID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
+func (h *Handler) RevenueStats(c *gin.Context) {
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	venueID := parseUintQuery(c, "venue_id")
+	stats, err := h.StatsSvc.GetRevenueStats(startDate, endDate, venueID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
+}
+
+func (h *Handler) VenueStats(c *gin.Context) {
+	startDate := c.Query("start_date")
+	endDate := c.Query("end_date")
+	stats, err := h.StatsSvc.GetStatsByVenue(startDate, endDate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
 }
 
 // ---------- 仪表盘 ----------
@@ -235,18 +842,34 @@ func (h *Handler) DashboardStats(c *gin.Context) {
 	h.DB.Model(&models.Venue{}).Count(&venueTotal)
 	h.DB.Model(&models.Venue{}).Where("status = ?", "open").Count(&venueOpen)
 	h.DB.Model(&models.Booking{}).Count(&bookingTotal)
-	h.DB.Model(&models.Booking{}).Where("status = ?", "booked").Count(&bookingActive)
+	h.DB.Model(&models.Booking{}).Where("status = ? OR status = ?", models.BookingBooked, models.BookingPaid).Count(&bookingActive)
 
 	var revenue float64
-	h.DB.Model(&models.Booking{}).Where("status <> ?", "cancelled").
-		Select("COALESCE(SUM(amount),0)").Scan(&revenue)
+	h.DB.Model(&models.Booking{}).Where("status <> ?", models.BookingCancelled).
+		Select("COALESCE(SUM(paid_amount), 0)").Scan(&revenue)
+	if revenue == 0 {
+		h.DB.Model(&models.Booking{}).Where("status <> ?", models.BookingCancelled).
+			Select("COALESCE(SUM(amount), 0)").Scan(&revenue)
+	}
+
+	var totalWalletBalance, totalFrozen float64
+	h.DB.Model(&models.Wallet{}).Select("COALESCE(SUM(balance), 0)").Scan(&totalWalletBalance)
+	h.DB.Model(&models.Wallet{}).Select("COALESCE(SUM(frozen_amount), 0)").Scan(&totalFrozen)
+
+	var cancelCount, noShowCount int64
+	h.DB.Model(&models.Booking{}).Where("status = ?", models.BookingCancelled).Count(&cancelCount)
+	h.DB.Model(&models.Booking{}).Where("status = ?", models.BookingNoShow).Count(&noShowCount)
 
 	c.JSON(http.StatusOK, gin.H{
-		"venue_total":     venueTotal,
-		"venue_open":      venueOpen,
-		"booking_total":   bookingTotal,
-		"booking_active":  bookingActive,
-		"revenue_total":   revenue,
+		"venue_total":         venueTotal,
+		"venue_open":          venueOpen,
+		"booking_total":       bookingTotal,
+		"booking_active":      bookingActive,
+		"revenue_total":       revenue,
+		"total_wallet_balance": totalWalletBalance,
+		"total_frozen":        totalFrozen,
+		"cancel_count":        cancelCount,
+		"no_show_count":       noShowCount,
 	})
 }
 
