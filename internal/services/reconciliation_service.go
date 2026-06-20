@@ -21,8 +21,8 @@ func NewReconciliationService(db *gorm.DB) *ReconciliationService {
 // DailyStats 某一天的各项数据。
 type DailyStats struct {
 	Date               string
-	ExpectedIncome     float64 // 预订应收（新创建且非取消的订单金额）
-	ActualIncome       float64 // 钱包实收（consume 类型流水金额绝对值和）
+	ExpectedIncome     float64 // 预订应收（新创建且非取消的订单支付金额）
+	ActualIncome       float64 // 钱包实收（consume 类型流水金额）
 	TotalRefund        float64 // 退款总额
 	TotalPenalty       float64 // 违约金总额
 	TotalDepositIn     float64 // 押金冻结
@@ -38,13 +38,14 @@ func (s *ReconciliationService) collectDailyStats(date string) (*DailyStats, err
 
 	stats := &DailyStats{Date: date}
 
-	// 预订应收：当天创建的非取消订单
+	// 预订应收：当天创建的非取消订单的支付金额
 	var bookings []models.Booking
 	s.DB.Where("created_at >= ? AND created_at < ?", dayStart, dayEnd).Find(&bookings)
 	for _, b := range bookings {
 		if b.Status != models.BookingCancelled {
-			stats.ExpectedIncome += b.PaidAmount
-			if stats.ExpectedIncome == 0 {
+			if b.PaidAmount > 0 {
+				stats.ExpectedIncome += b.PaidAmount
+			} else {
 				stats.ExpectedIncome += b.Amount
 			}
 		}
@@ -61,24 +62,27 @@ func (s *ReconciliationService) collectDailyStats(date string) (*DailyStats, err
 			stats.TotalRefund += tx.Amount
 		case models.TxPenalty, models.TxNoShowPenalty:
 			stats.TotalPenalty += -tx.Amount
-		case models.TxDepositFreeze:
-			stats.TotalDepositIn += tx.Amount
-			if stats.TotalDepositIn == 0 {
-				stats.TotalDepositIn += 0
-			}
-		case models.TxDepositRefund:
-			stats.TotalDepositOut += tx.Amount
-			if stats.TotalDepositOut == 0 {
-				stats.TotalDepositOut += 0
-			}
-		case models.TxDepositDeduct:
-			stats.TotalDepositDeduct += -tx.Amount
 		case models.TxRecharge:
 			stats.TotalRecharge += tx.Amount
+		case models.TxDepositFreeze:
+			frozenDiff := tx.FrozenAfter - tx.FrozenBefore
+			if frozenDiff > 0 {
+				stats.TotalDepositIn += frozenDiff
+			}
+		case models.TxDepositRefund:
+			frozenDiff := tx.FrozenBefore - tx.FrozenAfter
+			if frozenDiff > 0 {
+				stats.TotalDepositOut += frozenDiff
+			}
+		case models.TxDepositDeduct:
+			frozenDiff := tx.FrozenBefore - tx.FrozenAfter
+			if frozenDiff > 0 {
+				stats.TotalDepositDeduct += frozenDiff
+			}
 		}
 	}
 
-	// 押金流水再独立统计一次（避免上面没算到）
+	// 押金流水再从 Deposit 表独立校验
 	var deposits []models.Deposit
 	s.DB.Where("created_at >= ? AND created_at < ?", dayStart, dayEnd).Find(&deposits)
 	for _, d := range deposits {
@@ -104,38 +108,59 @@ func (s *ReconciliationService) DoReconciliation(date string) (*models.Reconcili
 	}
 
 	var recon models.Reconciliation
+	var diffs []models.ReconDiff
+
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		recon = models.Reconciliation{
-			ReconDate:          date,
-			ExpectedIncome:     stats.ExpectedIncome,
-			ActualIncome:       stats.ActualIncome,
-			TotalRefund:        stats.TotalRefund,
-			TotalPenalty:       stats.TotalPenalty,
-			TotalDepositIn:     stats.TotalDepositIn,
-			TotalDepositOut:    stats.TotalDepositOut,
-			TotalDepositDeduct: stats.TotalDepositDeduct,
-			TotalRecharge:      stats.TotalRecharge,
-			DiffAmount:         diffAmount,
-			Status:             status,
+		// 检查是否已存在当日对账记录
+		var existing models.Reconciliation
+		hasExisting := false
+		if err := tx.Where("recon_date = ?", date).First(&existing).Error; err == nil {
+			hasExisting = true
+			recon = existing
 		}
 
-		var existing models.Reconciliation
-		if err := tx.Where("recon_date = ?", date).First(&existing).Error; err == nil {
-			recon.ID = existing.ID
-			if err := tx.Save(&recon).Error; err != nil {
+		updates := map[string]interface{}{
+			"expected_income":      stats.ExpectedIncome,
+			"actual_income":        stats.ActualIncome,
+			"total_refund":         stats.TotalRefund,
+			"total_penalty":        stats.TotalPenalty,
+			"total_deposit_in":     stats.TotalDepositIn,
+			"total_deposit_out":    stats.TotalDepositOut,
+			"total_deposit_deduct": stats.TotalDepositDeduct,
+			"total_recharge":       stats.TotalRecharge,
+			"diff_amount":          diffAmount,
+			"status":               status,
+		}
+
+		if hasExisting {
+			if err := tx.Model(&recon).Updates(updates).Error; err != nil {
 				return err
 			}
-			tx.Where("recon_id = ?", existing.ID).Delete(&models.ReconDiff{})
+			// 清除旧的差异明细
+			if err := tx.Where("recon_id = ?", recon.ID).Delete(&models.ReconDiff{}).Error; err != nil {
+				return err
+			}
 		} else {
+			recon = models.Reconciliation{
+				ReconDate:          date,
+				ExpectedIncome:     stats.ExpectedIncome,
+				ActualIncome:       stats.ActualIncome,
+				TotalRefund:        stats.TotalRefund,
+				TotalPenalty:       stats.TotalPenalty,
+				TotalDepositIn:     stats.TotalDepositIn,
+				TotalDepositOut:    stats.TotalDepositOut,
+				TotalDepositDeduct: stats.TotalDepositDeduct,
+				TotalRecharge:      stats.TotalRecharge,
+				DiffAmount:         diffAmount,
+				Status:             status,
+			}
 			if err := tx.Create(&recon).Error; err != nil {
 				return err
 			}
 		}
 
-		var diffs []models.ReconDiff
-
 		// 差异1：预订收入 vs 钱包消费流水
-		if stats.ExpectedIncome != stats.ActualIncome {
+		if (stats.ExpectedIncome - stats.ActualIncome) > 0.01 || (stats.ActualIncome - stats.ExpectedIncome) > 0.01 {
 			diffs = append(diffs, models.ReconDiff{
 				ReconID:     recon.ID,
 				ReconDate:   date,
@@ -202,19 +227,23 @@ func (s *ReconciliationService) DoReconciliation(date string) (*models.Reconcili
 			}
 		}
 
+		// 批量写入差异明细
 		if len(diffs) > 0 {
 			if err := tx.Create(&diffs).Error; err != nil {
 				return err
 			}
-			recon.Status = models.ReconMismatch
-			tx.Save(&recon)
-			return nil
 		}
+
 		return nil
 	})
-	var diffs []models.ReconDiff
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 重新查询最新的差异明细
 	s.DB.Where("recon_id = ?", recon.ID).Find(&diffs)
-	return &recon, diffs, err
+	return &recon, diffs, nil
 }
 
 // ListReconciliations 查询对账记录。
@@ -245,16 +274,18 @@ func (s *ReconciliationService) ListReconciliations(startDate, endDate string, s
 // GetReconciliationDiffs 查询某次对账的差异明细。
 func (s *ReconciliationService) GetReconciliationDiffs(reconID uint) ([]models.ReconDiff, error) {
 	var diffs []models.ReconDiff
-	err := s.DB.Where("recon_id = ?", reconID).Find(&diffs).Error
+	err := s.DB.Where("recon_id = ?", reconID).Order("id").Find(&diffs).Error
 	return diffs, err
 }
 
-// WalletBalanceRecon 全量钱包余额校验：所有钱包余额+冻结 vs 所有流水代数和。
-func (s *ReconciliationService) WalletBalanceRecon() (map[string]float64, []uint, error) {
+// WalletBalanceRecon 全量钱包余额校验：
+// 校验1：所有钱包的 balance 总和 = 所有流水的 amount 代数和
+// 校验2：所有钱包的 frozen 总和 = 当前所有有效冻结金额
+func (s *ReconciliationService) WalletBalanceRecon() (map[string]interface{}, []uint, error) {
 	var allWallets []models.Wallet
 	s.DB.Find(&allWallets)
 
-	result := map[string]float64{}
+	result := map[string]interface{}{}
 	var totalBalance, totalFrozen float64
 	for _, w := range allWallets {
 		totalBalance += w.Balance
@@ -262,15 +293,30 @@ func (s *ReconciliationService) WalletBalanceRecon() (map[string]float64, []uint
 	}
 	result["total_balance"] = totalBalance
 	result["total_frozen"] = totalFrozen
+	result["total_assets"] = totalBalance + totalFrozen
 
-	var sumTx float64
+	// 校验1：所有流水 amount 总和 vs 所有钱包 balance 总和
+	var sumTxAmount float64
 	s.DB.Model(&models.WalletTransaction{}).
 		Select("COALESCE(SUM(amount), 0)").
-		Scan(&sumTx)
-	result["sum_all_tx_amount"] = sumTx
-	result["diff"] = totalBalance - sumTx
+		Scan(&sumTxAmount)
+	result["sum_tx_amount"] = sumTxAmount
+	result["balance_diff"] = totalBalance - sumTxAmount
+	balanceOk := (totalBalance - sumTxAmount) < 0.01 && (sumTxAmount - totalBalance) < 0.01
+	result["balance_match"] = balanceOk
 
-	// 找出每个钱包的不一致
+	// 校验2：所有 active 状态 WalletFreeze 的金额总和 vs 所有钱包 frozen 总和
+	var sumActiveFreeze float64
+	s.DB.Model(&models.WalletFreeze{}).
+		Where("status = ?", "active").
+		Select("COALESCE(SUM(amount), 0)").
+		Scan(&sumActiveFreeze)
+	result["sum_active_freeze"] = sumActiveFreeze
+	result["frozen_diff"] = totalFrozen - sumActiveFreeze
+	frozenOk := (totalFrozen - sumActiveFreeze) < 0.01 && (sumActiveFreeze - totalFrozen) < 0.01
+	result["frozen_match"] = frozenOk
+
+	// 校验3：每笔钱包单独校验
 	var mismatchWallets []uint
 	for _, w := range allWallets {
 		var wSum float64
@@ -278,11 +324,13 @@ func (s *ReconciliationService) WalletBalanceRecon() (map[string]float64, []uint
 			Where("wallet_id = ?", w.ID).
 			Select("COALESCE(SUM(amount), 0)").
 			Scan(&wSum)
-		if (w.Balance - wSum) > 0.01 || (w.Balance - wSum) < -0.01 {
+		diff := w.Balance - wSum
+		if diff > 0.01 || diff < -0.01 {
 			mismatchWallets = append(mismatchWallets, w.ID)
 		}
 	}
-	result["mismatch_count"] = float64(len(mismatchWallets))
+	result["mismatch_wallet_count"] = len(mismatchWallets)
+	result["overall_match"] = balanceOk && frozenOk && len(mismatchWallets) == 0
 
 	return result, mismatchWallets, nil
 }

@@ -258,7 +258,7 @@ func (s *WalletService) Freeze(customerID uint, amount float64, freezeType, rela
 		if freezeType == "deposit" {
 			txType = models.TxDepositFreeze
 		}
-		if err := s.createTx(tx, wallet.ID, customerID, txType, 0,
+		if err := s.createTx(tx, wallet.ID, customerID, txType, -amount,
 			balBefore, balAfter, fzBefore, fzAfter, relatedType, relatedID, orderNo, remark); err != nil {
 			return err
 		}
@@ -276,6 +276,7 @@ func (s *WalletService) Unfreeze(freezeID uint, remark string) error {
 	if freeze.Status != "active" {
 		return errors.New("冻结记录状态异常，无法解冻")
 	}
+	unfreezeOrderNo := genOrderNo("UF")
 
 	return s.DB.Transaction(func(tx *gorm.DB) error {
 		wallet, err := s.GetOrCreateWallet(freeze.CustomerID)
@@ -315,12 +316,12 @@ func (s *WalletService) Unfreeze(freezeID uint, remark string) error {
 		if freeze.FreezeType == "deposit" {
 			txType = models.TxDepositRefund
 		}
-		return s.createTx(tx, wallet.ID, freeze.CustomerID, txType, 0,
-			balBefore, balAfter, fzBefore, fzAfter, freeze.RelatedType, freeze.RelatedID, freeze.OrderNo, remark)
+		return s.createTx(tx, wallet.ID, freeze.CustomerID, txType, freeze.Amount,
+			balBefore, balAfter, fzBefore, fzAfter, freeze.RelatedType, freeze.RelatedID, unfreezeOrderNo, remark)
 	})
 }
 
-// DeductFromFreeze 从冻结金额中扣减（不退回余额）。
+// DeductFromFreeze 从冻结金额中扣减（不退回余额，直接从冻结额核销）。
 func (s *WalletService) DeductFromFreeze(freezeID uint, amount float64, txType models.WalletTxType, remark string) error {
 	if amount <= 0 {
 		return errors.New("扣减金额必须大于0")
@@ -335,6 +336,7 @@ func (s *WalletService) DeductFromFreeze(freezeID uint, amount float64, txType m
 	if freeze.Amount < amount {
 		return errors.New("冻结金额不足")
 	}
+	deductOrderNo := genOrderNo("DD")
 
 	return s.DB.Transaction(func(tx *gorm.DB) error {
 		wallet, err := s.GetOrCreateWallet(freeze.CustomerID)
@@ -373,8 +375,69 @@ func (s *WalletService) DeductFromFreeze(freezeID uint, amount float64, txType m
 			return err
 		}
 
-		return s.createTx(tx, wallet.ID, freeze.CustomerID, txType, -amount,
-			balBefore, balBefore, fzBefore, fzAfter, freeze.RelatedType, freeze.RelatedID, freeze.OrderNo, remark)
+		return s.createTx(tx, wallet.ID, freeze.CustomerID, txType, 0,
+			balBefore, balBefore, fzBefore, fzAfter, freeze.RelatedType, freeze.RelatedID, deductOrderNo, remark)
+	})
+}
+
+// PartialUnfreeze 部分解冻，冻结金额退回到可用余额。
+func (s *WalletService) PartialUnfreeze(freezeID uint, amount float64, txType models.WalletTxType, remark string) error {
+	if amount <= 0 {
+		return errors.New("解冻金额必须大于0")
+	}
+	var freeze models.WalletFreeze
+	if err := s.DB.First(&freeze, freezeID).Error; err != nil {
+		return errors.New("冻结记录不存在")
+	}
+	if freeze.Status != "active" {
+		return errors.New("冻结记录状态异常")
+	}
+	if freeze.Amount < amount {
+		return errors.New("冻结金额不足")
+	}
+	unfreezeOrderNo := genOrderNo("PU")
+
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		wallet, err := s.GetOrCreateWallet(freeze.CustomerID)
+		if err != nil {
+			return err
+		}
+
+		balBefore := wallet.Balance
+		balAfter := wallet.Balance + amount
+		fzBefore := wallet.FrozenAmount
+		fzAfter := wallet.FrozenAmount - amount
+		if fzAfter < 0 {
+			fzAfter = 0
+		}
+
+		result := tx.Model(&models.Wallet{}).
+			Where("id = ? AND version = ?", wallet.ID, wallet.Version).
+			Updates(map[string]interface{}{
+				"balance":       balAfter,
+				"frozen_amount": fzAfter,
+				"version":       wallet.Version + 1,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("钱包更新冲突，请重试")
+		}
+
+		status := "unfrozen"
+		if freeze.Amount > amount {
+			status = "active"
+		}
+		if err := tx.Model(&freeze).Updates(map[string]interface{}{
+			"amount": freeze.Amount - amount,
+			"status": status,
+		}).Error; err != nil {
+			return err
+		}
+
+		return s.createTx(tx, wallet.ID, freeze.CustomerID, txType, amount,
+			balBefore, balAfter, fzBefore, fzAfter, freeze.RelatedType, freeze.RelatedID, unfreezeOrderNo, remark)
 	})
 }
 

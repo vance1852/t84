@@ -138,12 +138,14 @@ func (s *DepositService) PartialRefundDeposit(depositID uint, refundAmount float
 
 	var freeze models.WalletFreeze
 	if err := s.DB.Where("order_no = ?", deposit.FreezeOrderNo).First(&freeze).Error; err == nil {
-		if refundAmount == freeze.Amount {
+		if refundAmount >= freeze.Amount {
 			if err := s.WalletSvc.Unfreeze(freeze.ID, remark); err != nil {
 				return err
 			}
 		} else {
-			return errors.New("部分退还押金需要先解冻相应金额，当前操作需走全额解冻")
+			if err := s.WalletSvc.PartialUnfreeze(freeze.ID, refundAmount, models.TxDepositRefund, remark); err != nil {
+				return err
+			}
 		}
 	}
 
